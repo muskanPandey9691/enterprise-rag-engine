@@ -95,8 +95,7 @@ enterprise-rag-engine/
 ## Limitations
 
 - One PDF at a time. Uploading a different PDF or changing chunk settings rebuilds the index.
-- The PDF must contain selectable text. Scanned PDFs need OCR first.
 - Verification confirms the quoted line exists on the cited page. It does not prove the line fully supports the
   answer, so a human should still read the cited line for important decisions.
 - Page numbers are PDF page positions (page 1 is the first page), not the numbers printed on the page.
-- Model names can change. If Gemini access changes, edit the model name in the sidebar or `DEFAULT_LLM_MODEL` in `rag_core.py`.
+
