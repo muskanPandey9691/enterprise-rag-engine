@@ -1,24 +1,19 @@
-import os
-import tempfile
-from pathlib import Path
-
+import pandas as pd
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_classic.chains import create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
 
-st.set_page_config(
-    page_title="Enterprise RAG Engine",
-    page_icon="📚",
-    layout="wide",
+from citations import page_label, rows_to_records, score_rows
+from rag_core import DEFAULT_LLM_MODEL, answer_question, build_index, evaluate, make_models
+
+APP_NAME = "DocuQuery"
+APP_TAGLINE = "RAG-based PDF Compliance Assistant"
+
+st.set_page_config(page_title=f"{APP_NAME} — {APP_TAGLINE}", page_icon="📚", layout="wide")
+
+st.title(f"📚 {APP_NAME}")
+st.caption(
+    f"{APP_TAGLINE} · Every answer comes with the page number and the exact line it is based on, "
+    "so it can be audited."
 )
-
-st.title("📚 Enterprise RAG Engine")
-st.caption("Ask questions about your PDFs and receive answers grounded in retrieved document content.")
 
 with st.sidebar:
     st.header("Configuration")
@@ -28,6 +23,7 @@ with st.sidebar:
         help="Your key is used only for this app session. Do not commit it to GitHub.",
     )
     st.markdown("[Get a Gemini API key](https://aistudio.google.com/apikey)")
+    llm_model = st.text_input("Gemini model", value=DEFAULT_LLM_MODEL)
     st.divider()
     st.subheader("Retrieval settings")
     chunk_size = st.slider("Chunk size (characters)", 300, 1500, 700, step=100)
@@ -41,33 +37,26 @@ if not api_key:
         **How it works**
         1. Add your Gemini API key.
         2. Upload a PDF document.
-        3. Wait while the app extracts and indexes its text.
-        4. Ask questions and inspect the source passages used in each answer.
+        3. Ask questions. Each answer cites the **page** and the **exact line** it relies on,
+           and the app checks that the line really exists on that page.
+        4. Use the **Evaluate** tab to measure accuracy on your own test questions.
         """
     )
     st.stop()
 
-os.environ["GOOGLE_API_KEY"] = api_key
-
 
 @st.cache_resource(show_spinner=False)
-def load_models(_api_key: str):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    llm = ChatGoogleGenerativeAI(
-    model="gemini-3.8-flash",
-    max_retries=6
-)
-    return embeddings, llm
+def load_models(_api_key: str, model_name: str):
+    return make_models(_api_key, model_name)
 
 
 try:
-    embeddings, llm = load_models(api_key)
+    embeddings, llm = load_models(api_key, llm_model)
 except Exception as exc:
     st.error(f"Could not initialize Gemini. Check your API key and model access. Details: {exc}")
     st.stop()
 
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
-
 if uploaded_file is None:
     st.info("Upload a PDF to create your searchable knowledge base.")
     st.stop()
@@ -76,84 +65,155 @@ if uploaded_file is None:
 file_signature = (uploaded_file.name, uploaded_file.size, chunk_size, chunk_overlap)
 if st.session_state.get("file_signature") != file_signature:
     with st.spinner("Reading PDF and building the searchable index..."):
-        temp_path = None
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                temp_file.write(uploaded_file.getvalue())
-                temp_path = temp_file.name
-
-            pages = PyPDFLoader(temp_path).load()
-            if not pages or not any(page.page_content.strip() for page in pages):
-                st.error("No readable text was found. This may be a scanned PDF; run OCR first.")
-                st.stop()
-
-            splitter = RecursiveCharacterTextSplitter(
+            st.session_state.index = build_index(
+                uploaded_file.getvalue(),
+                uploaded_file.name,
+                embeddings,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
-                length_function=len,
             )
-            chunks = splitter.split_documents(pages)
-            if not chunks:
-                st.error("The PDF did not contain any text chunks to index.")
-                st.stop()
-
-            vector_store = Chroma.from_documents(chunks, embeddings)
-            st.session_state.vector_store = vector_store
             st.session_state.file_signature = file_signature
-            st.session_state.document_name = uploaded_file.name
-            st.session_state.chunk_count = len(chunks)
-            st.session_state.page_count = len(pages)
+            st.session_state.answer_cache = {}
+            st.session_state.eval_rows = None
         except Exception as exc:
             st.error(f"Document processing failed: {exc}")
             st.stop()
-        finally:
-            if temp_path and Path(temp_path).exists():
-                os.unlink(temp_path)
 
-st.success(
-    f"Indexed **{st.session_state.document_name}** — "
-    f"{st.session_state.page_count} pages, {st.session_state.chunk_count} text chunks."
-)
+index = st.session_state.index
+st.success(f"Indexed **{index.name}** — {index.page_count} pages, {index.chunk_count} text chunks.")
 
-retriever = st.session_state.vector_store.as_retriever(search_kwargs={"k": top_k})
+ask_tab, eval_tab = st.tabs(["💬 Ask", "🧪 Evaluate"])
 
-system_prompt = (
-    "You are an enterprise document assistant. Answer using only the supplied context. "
-    "If the context does not contain the answer, clearly say that the information is "
-    "not available in the uploaded document. Do not invent facts. "
-    "When useful, mention the page number(s) supporting your answer.\n\n"
-    "Context:\n{context}"
-)
-prompt = ChatPromptTemplate.from_messages(
-    [("system", system_prompt), ("human", "{input}")]
-)
-qa_chain = create_stuff_documents_chain(llm, prompt)
-rag_chain = create_retrieval_chain(retriever, qa_chain)
+# --------------------------------------------------------------------------- #
+# Ask tab: answer + page + exact line
+# --------------------------------------------------------------------------- #
+with ask_tab:
+    question = st.text_input(
+        "Enter a question",
+        placeholder="For example: What is the waiting period for pre-existing conditions?",
+        key="question",
+    )
 
-st.divider()
-st.subheader("💬 Ask your document")
-question = st.text_input(
-    "Enter a question",
-    placeholder="For example: What are the main objectives described in this document?",
-    key="question",
-)
+    if question:
+        cache_key = (file_signature, llm_model, top_k, question)
+        cache = st.session_state.setdefault("answer_cache", {})
+        if cache_key not in cache:
+            with st.spinner("Searching the document and preparing a cited answer..."):
+                try:
+                    cache[cache_key] = answer_question(index, llm, question, top_k=top_k)
+                except Exception as exc:
+                    st.error(f"Question answering failed: {exc}")
+        result = cache.get(cache_key)
 
-if question:
-    with st.spinner("Searching the document and preparing an answer..."):
-        try:
-            result = rag_chain.invoke({"input": question})
+        if result is not None:
             st.markdown("### Answer")
-            st.write(result["answer"])
+            st.write(result.answer)
 
-            with st.expander("📖 View retrieved source passages", expanded=True):
-                for index, doc in enumerate(result.get("context", []), start=1):
-                    page_number = doc.metadata.get("page")
-                    page_label = page_number + 1 if isinstance(page_number, int) else "Unknown"
-                    st.markdown(f"**Source {index} · Page {page_label}**")
+            st.markdown("### 🔎 Sources (audit trail)")
+            if result.citations:
+                for n, cite in enumerate(result.citations, start=1):
+                    badge = "✅ verified in document" if cite.verified else "⚠️ not found verbatim on this page"
+                    st.markdown(f"**[{n}] Page {cite.page}** · {badge}")
+                    st.markdown(f"> {cite.quote}")
+                if any(not c.verified for c in result.citations):
+                    st.warning(
+                        "At least one cited line could not be matched word-for-word to the retrieved "
+                        "text. Check the passages below before relying on this answer."
+                    )
+            elif not result.structured:
+                st.warning(
+                    "The model did not return structured citations for this question. "
+                    "The retrieved passages below are the closest sources."
+                )
+            else:
+                st.info("No supporting source was cited — the document may not contain this answer.")
+
+            with st.expander("📖 All retrieved passages", expanded=not result.citations):
+                for n, doc in enumerate(result.retrieved_docs, start=1):
+                    st.markdown(f"**Passage {n} · Page {page_label(doc.metadata) or 'Unknown'}**")
                     st.caption(doc.page_content)
-                    if index < len(result.get("context", [])):
-                        st.divider()
-        except Exception as exc:
-            st.error(f"Question answering failed: {exc}")
 
-st.caption("Note: Answers are generated by an LLM. Always verify important information against the cited source passages.")
+# --------------------------------------------------------------------------- #
+# Evaluate tab: Question | Bot Answer | Expected Page | Correct?
+# --------------------------------------------------------------------------- #
+with eval_tab:
+    st.markdown(
+        "Write test questions about the uploaded PDF and the page where each answer really is. "
+        "A question counts as **correct** when the bot cites a *verified* page that matches the "
+        "expected page. Separate several valid pages with `|` (e.g. `4|5`)."
+    )
+
+    csv_file = st.file_uploader(
+        "Optional: load questions from CSV (columns: question, expected_page)", type=["csv"], key="eval_csv"
+    )
+    if csv_file is not None and st.session_state.get("eval_csv_name") != csv_file.name:
+        try:
+            loaded = pd.read_csv(csv_file, dtype=str).rename(columns=str.lower)
+            st.session_state.eval_questions = loaded[["question", "expected_page"]].fillna("")
+            st.session_state.eval_csv_name = csv_file.name
+        except Exception as exc:
+            st.error(f"Could not read that CSV: {exc}. It needs 'question' and 'expected_page' columns.")
+
+    if "eval_questions" not in st.session_state:
+        st.session_state.eval_questions = pd.DataFrame(
+            {"question": [""] * 5, "expected_page": [""] * 5}
+        )
+
+    edited = st.data_editor(
+        st.session_state.eval_questions,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="eval_editor",
+        column_config={
+            "question": st.column_config.TextColumn("Question", width="large"),
+            "expected_page": st.column_config.TextColumn("Expected page", width="small"),
+        },
+    )
+
+    if st.button("▶ Run evaluation", type="primary"):
+        questions = [
+            {"question": str(q).strip(), "expected_page": str(p).strip()}
+            for q, p in zip(edited["question"], edited["expected_page"])
+            if str(q).strip() and str(q).strip().lower() != "nan"
+        ]
+        missing = [q["question"] for q in questions if not q["expected_page"] or q["expected_page"].lower() == "nan"]
+        if not questions:
+            st.warning("Add at least one question first.")
+        elif missing:
+            st.warning("Every question needs an expected page number.")
+        else:
+            bar = st.progress(0.0, text="Running evaluation...")
+            st.session_state.eval_rows = evaluate(
+                index,
+                llm,
+                questions,
+                top_k=top_k,
+                progress=lambda done, total: bar.progress(done / total, text=f"Question {done} of {total}"),
+            )
+            bar.empty()
+
+    rows = st.session_state.get("eval_rows")
+    if rows:
+        stats = score_rows(rows)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Accuracy", f"{stats['accuracy']:.0%}", f"{stats['correct']} of {stats['total']} correct")
+        col2.metric("Right page retrieved", f"{stats['retrieval_rate']:.0%}")
+        col3.metric("Questions", stats["total"])
+
+        table = pd.DataFrame(rows_to_records(rows))
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇ Download results (CSV)",
+            table.to_csv(index=False).encode("utf-8"),
+            file_name="docuquery_evaluation.csv",
+            mime="text/csv",
+        )
+        st.caption(
+            "Accuracy = the cited, verified page matches the expected page. "
+            "'Right page retrieved' only checks that retrieval found that page."
+        )
+
+st.caption(
+    "Note: Answers are generated by an LLM. Always verify important information against the cited source lines."
+)
