@@ -151,9 +151,20 @@ def answer_question(index: IndexedDocument, llm, question: str, top_k: int = 4) 
     docs = index.vector_store.similarity_search(question, k=top_k)
     if not docs:
         return AnswerResult(answer="No relevant passages were found in the document.")
+    return generate_cited_answer(llm, question, docs)
 
+
+def generate_cited_answer(llm, question: str, docs: list, extra_context: str = "") -> AnswerResult:
+    """Ask the LLM for a grounded answer over `docs`, then verify every citation.
+
+    Shared by the plain Q&A path, the multi-turn chat and the agent, so all of them
+    keep the same audit trail. `extra_context` is appended after the passages (the
+    agent uses it for calculator results); citations are only ever verified against `docs`."""
     prompt = ChatPromptTemplate.from_messages([("system", SYSTEM_PROMPT), ("human", "{question}")])
-    inputs = {"context": format_context(docs), "question": question}
+    context = format_context(docs)
+    if extra_context:
+        context = f"{context}\n\n---\n\n{extra_context}"
+    inputs = {"context": context, "question": question}
 
     try:
         parsed: CitedAnswer | None = (prompt | llm.with_structured_output(CitedAnswer)).invoke(inputs)

@@ -15,6 +15,29 @@ makes the source part of the answer.
    page. Each source is marked ✅ verified or ⚠️ not found verbatim, so a made-up quote is caught instead of trusted.
 5. **Evaluates itself.** The *Evaluate* tab (and `eval.py`) runs your test questions and reports
    Question | Bot Answer | Expected Page | Correct? plus an accuracy score.
+6. **Holds a conversation.** The *Chat* tab remembers the recent conversation, so follow-ups such as
+   "And for dependants?" work. Each message is first rewritten into a standalone question, then searched and answered
+   with the same verified citations.
+7. **Optional agent mode.** In the *Chat* tab, switch on **Agent mode** and the model chooses its own tools:
+   search the document (several times if needed), read a specific page, or calculate numbers. The final answer still
+   goes through the same grounded, citation-verified step, and the tool calls are shown in an expandable
+   "Agent steps" list.
+
+## Conversation memory and agent mode
+
+```text
+Chat message ──► condense with recent history ──► standalone question
+                                                      │
+                 plain mode ──────────────────────────┤──► retrieve top-k ──► cited answer ──► verify quotes
+                 agent mode: model picks tools  ──────┘    (search_document / get_page / calculate)
+```
+
+- `chat.py` rewrites follow-ups using the last 6 messages. If the rewrite is empty or suspiciously long, the original
+  message is used, so a bad rewrite can never replace what the user asked.
+- `agent.py` gives the model three tools and a step limit (5). The calculator parses arithmetic with `ast`; it never
+  uses `eval`, so it cannot run arbitrary code.
+- Agent mode costs more model calls and time than plain mode. Use it for multi-step questions; plain mode is better for
+  simple lookups.
 
 ## How accuracy is scored
 
@@ -65,7 +88,8 @@ pip install pytest
 python -m pytest tests
 ```
 
-The tests cover citation verification and scoring and need no API key.
+The tests cover citation verification and scoring, the conversation rewrite, the calculator, the agent tools and the
+agent loop. They use fake models, so they need no API key.
 
 ## Deploy on Streamlit Community Cloud
 
@@ -82,12 +106,14 @@ Do not commit API keys, credentials, private PDFs, or local database files to Gi
 
 ```text
 enterprise-rag-engine/
-├── app.py                      # Streamlit UI: Ask tab + Evaluate tab
+├── app.py                      # Streamlit UI: Ask, Chat and Evaluate tabs
 ├── rag_core.py                 # Indexing, retrieval, cited answers, evaluation loop
+├── chat.py                     # Conversation memory: follow-up rewriting + chat entry point
+├── agent.py                    # Tool-using agent: search_document, get_page, calculate
 ├── citations.py                # Quote verification and scoring (no API needed)
 ├── eval.py                     # Command-line evaluation
 ├── eval/questions_template.csv # Question set template
-├── tests/test_citations.py
+├── tests/                      # test_citations.py, test_chat.py, test_agent.py
 ├── requirements.txt
 └── README.md
 ```
@@ -98,4 +124,7 @@ enterprise-rag-engine/
 - Verification confirms the quoted line exists on the cited page. It does not prove the line fully supports the
   answer, so a human should still read the cited line for important decisions.
 - Page numbers are PDF page positions (page 1 is the first page), not the numbers printed on the page.
+- Chat memory lives only in the browser session: refreshing the page or uploading another PDF starts a new conversation.
+- Agent mode needs a Gemini model that supports tool calling, and the text inside the document is treated as data,
+  but, like any RAG app, it is not immune to prompt injection hidden in a PDF.
 

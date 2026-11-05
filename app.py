@@ -1,6 +1,7 @@
 import pandas as pd
 import streamlit as st
 
+from chat import ChatReply, ChatTurn, chat_answer
 from citations import page_label, rows_to_records, score_rows
 from rag_core import DEFAULT_LLM_MODEL, answer_question, build_index, evaluate, make_models
 
@@ -75,6 +76,7 @@ if st.session_state.get("file_signature") != file_signature:
             )
             st.session_state.file_signature = file_signature
             st.session_state.answer_cache = {}
+            st.session_state.chat_history = []  # a new document means a new conversation
             st.session_state.eval_rows = None
         except Exception as exc:
             st.error(f"Document processing failed: {exc}")
@@ -83,7 +85,30 @@ if st.session_state.get("file_signature") != file_signature:
 index = st.session_state.index
 st.success(f"Indexed **{index.name}** — {index.page_count} pages, {index.chunk_count} text chunks.")
 
-ask_tab, eval_tab = st.tabs(["💬 Ask", "🧪 Evaluate"])
+ask_tab, chat_tab, eval_tab = st.tabs(["💬 Ask", "🗨️ Chat", "🧪 Evaluate"])
+
+
+def render_reply(reply: ChatReply) -> None:
+    """Show one assistant turn: answer, verified sources, and what the agent did."""
+    st.write(reply.answer.answer)
+    if reply.answer.citations:
+        for n, cite in enumerate(reply.answer.citations, start=1):
+            badge = "✅ verified in document" if cite.verified else "⚠️ not found verbatim on this page"
+            st.markdown(f"**[{n}] Page {cite.page}** · {badge}")
+            st.markdown(f"> {cite.quote}")
+        if any(not c.verified for c in reply.answer.citations):
+            st.warning("At least one cited line could not be matched word-for-word. Check it before relying on this answer.")
+    elif reply.answer.structured:
+        st.caption("No supporting source was cited — the document may not contain this answer.")
+    else:
+        st.warning("The model did not return structured citations for this answer.")
+    if reply.standalone_question:
+        st.caption(f"🔍 Searched for: {reply.standalone_question}")
+    if reply.steps:
+        with st.expander(f"🛠️ Agent steps ({len(reply.steps)})"):
+            for n, step in enumerate(reply.steps, start=1):
+                st.code(f"{n}. {step}", language=None)
+
 
 # --------------------------------------------------------------------------- #
 # Ask tab: answer + page + exact line
@@ -133,6 +158,50 @@ with ask_tab:
                 for n, doc in enumerate(result.retrieved_docs, start=1):
                     st.markdown(f"**Passage {n} · Page {page_label(doc.metadata) or 'Unknown'}**")
                     st.caption(doc.page_content)
+
+# --------------------------------------------------------------------------- #
+# Chat tab: multi-turn conversation with memory, optional tool-using agent
+# --------------------------------------------------------------------------- #
+with chat_tab:
+    st.markdown(
+        "Ask follow-up questions in a conversation, such as *\"And for dependants?\"*. The app rewrites "
+        "each message into a standalone question using the recent chat, so the document search "
+        "understands it. Every answer keeps the verified page citations."
+    )
+    use_agent = st.toggle(
+        "Agent mode",
+        value=False,
+        help="The model decides which tools to use: search the document several times, read a "
+        "specific page, or calculate numbers. Slower (several model calls) but handles multi-step "
+        "questions such as 'What is the annual premium if the monthly premium is on page 3?'.",
+    )
+    if st.button("🗑️ Clear conversation"):
+        st.session_state.chat_history = []
+        st.rerun()
+
+    history: list[ChatTurn] = st.session_state.setdefault("chat_history", [])
+    for turn in history:
+        with st.chat_message(turn.role):
+            if turn.reply is not None:
+                render_reply(turn.reply)
+            else:
+                st.write(turn.content)
+
+    user_message = st.chat_input("Ask a question about the document...")
+    if user_message:
+        with st.chat_message("user"):
+            st.write(user_message)
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    reply = chat_answer(index, llm, user_message, history, top_k=top_k, use_agent=use_agent)
+                except Exception as exc:
+                    reply = None
+                    st.error(f"Could not answer: {exc}")
+            if reply is not None:
+                render_reply(reply)
+                history.append(ChatTurn("user", user_message))
+                history.append(ChatTurn("assistant", reply.answer.answer, reply))
 
 # --------------------------------------------------------------------------- #
 # Evaluate tab: Question | Bot Answer | Expected Page | Correct?
